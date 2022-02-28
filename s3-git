@@ -1,0 +1,167 @@
+#!/usr/bin/perl
+#use 5.030 ;  # 5.010 5.008 5.001 でも動作は確かめた。(2022-02-02T16:47:10.622+09:00)
+use feature qw[ say ] ; 
+use autodie qw[ open ] ;
+use warnings ; 
+use FindBin qw[ $Script ] ;
+use Getopt::Std ; getopts '2Flnpz:' , \my %o ; 
+use POSIX qw [ strftime ] ; 
+use Term::ANSIColor qw[ :constants ] ; $Term::ANSIColor::AUTORESET = 1 ;
+use Time::HiRes qw[ gettimeofday tv_interval ] ; 
+use Time::Local qw[ timegm ] ; # タイムゾーンに依存する時差を計算するため
+
+$o{z} //= 25e6 ; # データファイルが大きい場合に備えて、gzipしないバイトサイズの上限。Githubは50MBで警告が来て、100MBで受け付けないとある。
+my $time_start ;
+BEGIN{ $time_start = [ gettimeofday ] }; 
+END{ say STDERR GREEN BOLD FAINT sprintf ("%s\tElapsed: PT%0.3fS", &dt1000, tv_interval $time_start), RESET GREEN BOLD qq[ -- "$Script" Ended.] }
+do { & commit_git ( $_ ) for @ARGV ; exit } if $o{F} ; # -F により、このプログラムの引数に与えられた名前を持つファイルだけを s3 syncせずにコミット。
+
+do { & HELP_MESSAGE ; exit } if $#ARGV <= 0 ; # 引数が足りない場合は、ヘルプを表示して終了。
+my $target = $ARGV[0]  ; # 取得したいS3上のターゲットの名前
+my $msg_spec = $ARGV[2] // '' ; # GITのコミットに残すメッセージの最初の部分になる。ファイルの中身を表すデータの名前を想定している。
+my $file_name = undef ; # $file_to_get =~ s/^https?:\/\/.*\///r ; # 作業ディレトクリ上のファイル名である。最後のスラッシュより後の文字列。($file_to_getはここで不変。) 
+
+& change_dir ( $ARGV[1] ) ; # $ARGV[1] // '.' としても良かったが、cronで実行されるので、ディレクトリ名は必ず指定する癖を作業者に付けさせる。
+my @FILES = & get_files (  ) ; 
+my $time_file_get = & dt100 () ; # Retreived Date Time 取得日時
+& commit_git ( $_ ) for @FILES ;# $file_name , $msg_spec , $time_file_get , $msg_lastmod, $file_lines , $file_bytes ) ; 
+exit 0 ; 
+
+sub change_dir ( $ ) {
+  my $pwd =  qx[ mkdir -p $_[0] ; cd $_[0] && pwd | tr -d '\n' ] ; #  chdir において ~USERNAME の書式が使えないので工夫した。
+  die BRIGHT_RED BOLD qq["cd $_[0]" failed] if $? ;
+  chdir $pwd or die qq [Failed: "chdir $pwd"] ; # ここでdieは考えにくいかも知れないが、このプログラムが短時間で多重起動された場合も考察したいので残す。
+}
+
+# ファイルを取ってくる。
+sub get_files ( ) {
+  exec qq[ aws s3 ls $target ] if $o{l} ; # execは戻ってこない (戻ってくるのはsystem)
+  exec qq[ aws s3 sync $target $ARGV[1] --dryrun ] if $o{n} ; # ドライラン
+  my $prt = qx [ aws s3 sync $target $ARGV[1] ] ; # ここで本当は $? ごとに動作を変えたい。
+  my @prt1 = split /[\r\n]/ , $prt , -1 ; 
+  my @files = grep { s/^download: .* to // } @prt1 ;
+  say STDERR GREEN FAINT &dt1000, RESET GREEN BOLD "\t$_", RESET GREEN DARK BOLD sprintf " -- downloaded (%s bytes).", & d3 (-s $_) for @files ;
+  return @files ;
+  }
+
+sub commit_git ( $ ) {
+  ## ここですごく時間がかかった→ exit if do { qx [ git diff ] =~ m/^\s*$/ } ;  # $diff の内容が無いなら、ここで終了。ゼロバイトとも限らないと思い、(空白文字だけを意味する)正規表現を用いた。
+  my $file = $_[0] =~ s/^\.\///r ; # 先頭の ./ の文字列を除去。
+  my $message = $ARGV[2] // $file ; # 
+  my ( $lines , $bytes ) = ( & d3 ( qx [ cat $file | wc -l ] =~ s/\n$//r ) , & d3 ( qx [ cat $file | wc -c ] =~ s/\n$//r ) ); # 行数、バイト数
+  my $lmm0 = do { my $t = [ stat $_[0] ]->[9] ; defined $t ? & mdf_time ( $t ) : '' } ; # 取得するファイルが最後に変更された日時(last modified)
+  my $msg1 = qq [$message $lines lines, $bytes bytes, $time_file_get retreived $lmm0 ] ; # GITのコメント文
+  my $msg2 = '' ;
+  if ( $bytes =~ s/,//gr >= $o{z} ) { qx [ gzip -f $file ] ; $file .= '.gz' } #  大きなファイルはgzip圧縮することになる。
+  else { $msg2 = qx [ git diff --stat -- $_[0] | tail -1 ] =~ s/\n$//r  } ; #「2 files changed, 11 insertions(+), 6 deletions(-)」のような情報を取り出す。
+  my $cmd = qq[git reset --mix ; git add $file ; git status -s | grep -F $file && git commit -q -m '$msg1' -m '$msg2'] ; # <-- cronで実行の時に出力が少ない方が良いため
+  $cmd .= ' && git push' if $o{p} ;
+  qx[ $cmd ] ;
+  say STDERR YELLOW BOLD FAINT join "\t" , & dt1000 , $cmd ; 
+  say STDERR YELLOW BOLD FAINT & dt1000 , "\t\$?=", RESET YELLOW $? ; # Git 2.29だと、commitがなされた時のみsuccessになるようだが、ドキュメントに見当たらず。
+}
+
+# ファイル書込とGitのコマンド起動
+sub write_file ( $$$$ $$$ ) { 
+  my $lmm0 = do { my $t = [ stat $_[0] ]->[9] ; defined $t ? & mdf_time ( $t ) : '' } ; # 取得するファイルが最後に変更された日時(last modified)
+  say STDERR YELLOW BOLD & dt1000 , "\t" , qx[ pwd ] =~ s/\n$//r , BOLD FAINT qq[ Trying to get $_[2] "$_[3]" $lmm0] ; ## 作業ディレクトリ名の(端末)出力
+  do { open my $FH , '>' , $_[0] ; print {$FH} $_[1] } ; # ファイルに取得した内容をここで保存する。
+  exit if do { qx [ git diff ] =~ m/^\s*$/ } ;  # $diff の内容が無いなら、ここで終了。ゼロバイトとも限らないと思い、(空白文字だけを意味する)正規表現を用いた。
+  @_[4..6] = ( $lmm0 , & d3 ( qx [ cat $_[0] | wc -l ] =~ s/\n$//r ) , & d3 ( qx [ cat $_[0] | wc -c ] =~ s/\n$//r ) ); # 行数、バイト数
+}
+
+# 最後にいつ変更されたかについてのメッセージの文を構成する。(write_fileから呼び出される。)
+sub mdf_time ( $ ) { 
+  my $message1 = strftime 'modified: %Y-%m-%d %H:%M', localtime $_[0] ;
+  my $delta = time - $_[0] ; 
+  my ( $days, $sec ) = ( int $delta / 86400 , $delta % 86400 ) ;
+  my $dhms = do { my $h = int $sec / 3600 ; my $m = int ($sec - $h*3600) / 60 ; sprintf '<- P%dT%02d:%02d:%02d before' , $days, $h , $m , $sec % 60 } ;  
+  return "($message1 $dhms )" ; 
+}
+
+# 関数 dt100 : その時点の日時を0.01秒単位(10ミリ秒単位)で、日時記録を残すようにする。
+sub dt100 () { 
+  my $t = [ gettimeofday ] ; 
+  my $z = do { my $d = timegm(localtime)-timegm(gmtime) ; sprintf '%+03d:%02d', $d/3600, $d/60%60 } ;
+  strftime( '%Y-%m-%d %H:%M:%S.' . sprintf("%02d", $t->[1] / 1e4 ) . $z , localtime( $t->[0] ) ) 
+}
+
+# 関数 dt1000 () : その時点の日時を0.001秒単位(ミリ秒単位)で、日時記録を残すようにする。
+sub dt1000 { my $t = [ gettimeofday ] ; strftime( "%Y-%m-%d %H:%M:%S." . sprintf("%03d", $t->[1] / 1e3 ) , localtime( $t->[0] ) ) }
+
+# 数を3桁区切りに変換する。
+sub d3 ($) { $_[0] =~ s/(?<=\d)(?=(\d\d\d)+($|\D))/,/gr } ; 
+
+## ヘルプ (オプション --help が与えられた時に、動作する)
+sub VERSION_MESSAGE {}
+sub HELP_MESSAGE {
+  use FindBin qw[ $Script ] ; 
+  $ARGV[1] //= '' ;
+  open my $FH , '<' , $0 ;
+  while(<$FH>){
+    s/\$0/$Script/g ;
+    print $_ if s/^=head1// .. s/^=cut// and $ARGV[1] =~ /^o(p(t(i(o(ns?)?)?)?)?)?$/i ? m/^\s+\-/ : 1;
+  }
+  close $FH ;
+  exit 0 ;
+}
+
+=encoding utf8
+
+=head1
+
+$0 S3TARGET DIR [STR]
+ 
+ 機能: 
+
+   S3バケットのターゲット(バケット名またはフォルダ名、ファイル)を指定すると、
+   そこにあるオブジェクト(実体としてはファイル)を、
+   ローカルのGITレポジトリの下の指定ディレクトリDIRに保管する。
+  
+ 引数:  
+ 
+  このコマンドの実行には、2個または3個の引数を必要とする : 
+
+  1番目の引数 DIR は、ローカルにあるGitレポジトリで管理されるディレクトリ名。
+  2番目の引数 S3TARGET は、ターゲット名(フォルダの場合は必ず/で終わる必要がある)。
+  3番目の引数 STR は、Gitのコミットのメッセージに残す文字列(未指定も可能)。
+
+ 引数のオプション : 
+   -l : aws ls のみを実行する。
+   -n : aws sync のドライランを行う。
+   -p : git push も行う。
+   -z NUM : ファイルサイズがNUMバイト以上の場合、gzip 圧縮をする。その閾値の指定。未指定の場合は25e6(25メガ)。
+   -F : 指定ファイルを s3 syncはせずに、git commit する。このプログラム特有のgitコミットの書式で。
+
+ 環境変数: 
+
+   AWS_PROFILE  ;  AWS_PROFILE='profile' $0 .... のようにするのが良い。  
+
+ 想定されている目的: 
+
+   + インターネット上に公開されている任意のファイルをGitレポジトリに保管する。
+   + URLで指定できる特定のファイルを、cronで定期的にダウンロードして、保管する。
+
+ 必要な準備: 
+
+   1. Gitレポジトリを用意すること。つまり、git init または git clone .. をあらかじめ行う。
+   2. Mozilla::CAが未インストールであれば、cpanm Mozilla::CA などをあらかじめ行う。
+      そうしないと、以下の警告が出力される : 
+      「500 Can't verify SSL peers without knowing which Certificate Authorities to trust」
+
+  利用例 : 
+
+    # ターゲットであるファイルを、カレントディレクトリに持ってきて、gitレポジトリに反映する。
+    AWS_PROFILE=someprofile s3-git -l s3://bucketname/target .
+
+    # ターゲットであるフォルダの下の全てのファイルを、カレントディレクトリに持ってきて、gitレポジトリに反映する。
+    AWS_PROFILE=someprofile s3-git -l s3://bucketname/target/ .  
+
+  開発メモ : 
+
+   * 関数qxで実行したシステムコマンドが、短い時間で終了しない場合が厄介になりうる。その対策として、forkを使った凝ったプログラムにはまだしてない。
+
+=cut
+
+ 
+
